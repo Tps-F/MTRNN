@@ -1,68 +1,75 @@
-"""Train and replay the authors' published sample data.
+"""Train the MTRNN from scratch on the authors' sample recordings.
 
-    python examples/train_sample.py --reference "path/to/Yamashita Sample Sept 2011/tmp0"
+    python examples/train_sample.py
 
-With `--replay` it loads their trained weights instead of training, which is the
-quickest way to see the model reproduce Figure 3 of the paper.
+Fits the Kohonen maps, derives the initial states and learns the weights, all
+from the recordings committed as this repository's test fixture. The authors' C
+sample cannot train the maps -- its README says so outright -- which is the part
+of the pipeline this port exists to supply.
+
+    --replay   evaluate the authors' published weights instead of training.
 """
 
 import argparse
 from pathlib import Path
 
+import numpy as np
 import torch
 
-from mtrnn.data import load_reference
-from mtrnn.train import generate, report, train
+from mtrnn import MTRNNSystem, report, train
+
+FIXTURE = Path(__file__).resolve().parent.parent / "tests/reference/c_reference.npz"
+
+
+def behaviour_codes(n_seq: int, n_slow: int, bits: int = 5) -> torch.Tensor:
+    """One binary code per sequence, tiled across the slow context units.
+
+    The shipped `L.G.initA` uses a 5-bit code repeated four times over its 20
+    slow units, which is what distinguishes one learned behaviour from another.
+    """
+    if n_slow % bits or n_seq > 2**bits:
+        raise ValueError(f"{n_seq} sequences do not fit {bits} bits x {n_slow} units")
+    code = (torch.arange(n_seq)[:, None] >> torch.arange(bits)) & 1
+    return code.repeat(1, n_slow // bits).double()
 
 
 def main() -> None:
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--reference", type=Path, required=True, help="a tmpN/ directory")
-    p.add_argument("--replay", action="store_true", help="use the published weights")
-    p.add_argument("--epochs", type=int, default=2000)
-    p.add_argument("--lr", type=float, default=1e-3)
-    p.add_argument("--closed-rate", type=float, default=0.9)
-    p.add_argument("--out", type=Path, default=Path("runs/sample.pt"))
+    p.add_argument("--replay", action="store_true", help="evaluate published weights")
+    p.add_argument("--epochs", type=int, default=5000)
+    p.add_argument("--seed", type=int, default=0)
     args = p.parse_args()
+    torch.manual_seed(args.seed)
 
-    system, targets, mask, u0 = load_reference(
-        args.reference, weights="tmpL.wtA" if args.replay else None
-    )
-    print(
-        f"{targets.shape[0]} sequences, up to {targets.shape[1]} steps, "
-        f"{system.net.n_units} units"
-    )
+    ref = np.load(FIXTURE)
+    targets = torch.from_numpy(ref["targets"])
+    lengths = torch.from_numpy(ref["lengths"])
+    mask = (torch.arange(targets.shape[1])[None] < lengths[:, None]).to(targets)
+    system = MTRNNSystem().double()
 
-    if not args.replay:
-        log = lambda e, loss: e % 50 == 0 and print(f"epoch {e:5d}  KL {loss:.5f}")
+    if args.replay:
+        for tpm, name in zip(system.coder.maps, ["proprioception", "vision"]):
+            tpm.ref.copy_(torch.from_numpy(ref[f"map_ref_{name}"]))
+        system.net.weight.data.copy_(torch.from_numpy(ref["weight"]))
+        u0 = torch.from_numpy(ref["u0"])
+    else:
+        system.coder.fit(torch.cat([t[m.bool()] for t, m in zip(targets, mask)]))
+        u0 = system.initial_state(
+            targets, slow_code=behaviour_codes(len(targets), system.net.n_slow)
+        )
         train(
             system,
             targets,
             u0,
             mask=mask,
-            closed_rate=args.closed_rate,
             epochs=args.epochs,
-            lr=args.lr,
-            on_epoch=log,
+            on_epoch=lambda e, kl: e % 50 == 0 and print(f"epoch {e:5d}  KL {kl:.5f}"),
         )
 
     scores = report(system, targets, u0, mask=mask, closed_rate=1.0)
     for i, (mse, kl) in enumerate(zip(scores["mse"], scores["kl"])):
         print(f"seq {i}: closed-loop MSE {mse:.6f}  KL {kl:.6f}")
-
-    pred, u = generate(system, targets, u0, closed_rate=1.0)
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(
-        {
-            "state_dict": system.state_dict(),
-            "u0": u0,
-            "prediction": pred,
-            "potentials": u,
-            "mask": mask,
-        },
-        args.out,
-    )
-    print(f"saved {args.out}")
+    print(f"mean: MSE {scores['mse'].mean():.6f}  KL {scores['kl'].mean():.6f}")
 
 
 if __name__ == "__main__":

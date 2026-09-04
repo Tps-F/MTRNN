@@ -95,7 +95,10 @@ class TPM(nn.Module):
         """
         data = torch.as_tensor(data, dtype=self.ref.dtype, device=self.ref.device)
         data = data.reshape(-1, self.modality.dim)
-        pick = lambda n: data[torch.randint(len(data), (n,), generator=generator)]
+
+        def pick(n: int) -> Tensor:
+            return data[torch.randint(len(data), (n,), generator=generator)]
+
         self.ref.copy_(pick(self.modality.units))
         r0 = max(self.modality.shape) / 2 if radius is None else radius
         for s in range(steps):
